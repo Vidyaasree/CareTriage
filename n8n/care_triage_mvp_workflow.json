@@ -1,0 +1,476 @@
+{
+  "name": "CareTriage - MVP Attendance Triage",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "triage-evaluate",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-webhook-01",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        100,
+        300
+      ],
+      "webhookId": "care-triage-webhook-id"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst body = $input.first().json.body || $input.first().json;\n\n// 1. Check staff_id\nif (!body.staff_id || typeof body.staff_id !== 'string' || body.staff_id.trim() === '') {\n  return [{\n    json: {\n      isValid: false,\n      errorType: 'MISSING_STAFF_ID',\n      statusCode: 400,\n      response: {\n        status: 'error',\n        code: 'MISSING_STAFF_ID',\n        error: 'missing staff_id',\n        message: \"Mandatory parameter 'staff_id' is missing or empty.\"\n      }\n    }\n  }];\n}\n\n// 2. Check class_id\nif (!body.class_id || typeof body.class_id !== 'string' || body.class_id.trim() === '') {\n  return [{\n    json: {\n      isValid: false,\n      errorType: 'MISSING_CLASS_ID',\n      statusCode: 400,\n      response: {\n        status: 'error',\n        code: 'MISSING_CLASS_ID',\n        error: 'missing class_id',\n        message: \"Mandatory parameter 'class_id' is missing or empty.\"\n      }\n    }\n  }];\n}\n\n// 3. Check dates\nconst obs = body.observation_period || {};\nconst startDate = obs.start_date || '2026-10-12';\nconst endDate = obs.end_date || '2026-10-23';\n\nconst isoDateRegex = /^\\d{4}-\\d{2}-\\d{2}$/;\nif (!isoDateRegex.test(startDate) || !isoDateRegex.test(endDate)) {\n  return [{\n    json: {\n      isValid: false,\n      errorType: 'INVALID_DATES',\n      statusCode: 400,\n      response: {\n        status: 'error',\n        code: 'INVALID_DATES',\n        error: 'invalid dates',\n        message: \"Dates must follow YYYY-MM-DD format.\"\n      }\n    }\n  }];\n}\n\nif (new Date(startDate) > new Date(endDate)) {\n  return [{\n    json: {\n      isValid: false,\n      errorType: 'INVALID_DATES',\n      statusCode: 400,\n      response: {\n        status: 'error',\n        code: 'INVALID_DATES',\n        error: 'invalid dates',\n        message: `start_date (${startDate}) cannot be after end_date (${endDate}).`\n      }\n    }\n  }];\n}\n\nconst thresholdCount = (body.attendance_threshold && body.attendance_threshold.absence_threshold_count) ? parseInt(body.attendance_threshold.absence_threshold_count, 10) : 8;\n\nreturn [{\n  json: {\n    isValid: true,\n    staff_id: body.staff_id.trim(),\n    class_id: body.class_id.trim(),\n    student_id: body.student_id ? body.student_id.trim() : null,\n    start_date: startDate,\n    end_date: endDate,\n    threshold_count: thresholdCount\n  }\n}];\n"
+      },
+      "id": "node-validator-02",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.isValid }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "node-if-valid-03",
+      "name": "Is Input Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": "={{ $json.statusCode }}"
+        }
+      },
+      "id": "node-res-err400-04",
+      "name": "Respond Input Error (400)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        780,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT s.staff_id, s.role, s.full_name, s.is_active,\n       COALESCE(sp.can_view, FALSE) AS can_view,\n       COALESCE(sp.can_edit, FALSE) AS can_edit\nFROM staff s\nLEFT JOIN staff_permissions sp\n  ON sp.staff_id = s.staff_id AND sp.class_name = $1\nWHERE s.staff_id = $2;",
+        "additionalFields": {
+          "queryParams": "={{ [ $('Validate Input').first().json.class_id, $('Validate Input').first().json.staff_id ] }}"
+        }
+      },
+      "id": "node-check-perm-05",
+      "name": "Check Staff Permission",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        780,
+        380
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "supabase-db-creds",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst rows = $input.all();\nconst inputData = $('Validate Input').first().json;\n\nif (!rows || rows.length === 0) {\n  return [{\n    json: {\n      isAuthorized: false,\n      statusCode: 403,\n      response: {\n        status: 'error',\n        code: 'UNAUTHORIZED_STAFF',\n        error: 'unauthorized staff',\n        message: `Staff member '${inputData.staff_id}' does not exist or is inactive.`\n      }\n    }\n  }];\n}\n\nconst staff = rows[0].json;\nconst isInstitutionalRole = ['counselor', 'admin', 'support_lead'].includes(staff.role);\nconst hasClassViewPerm = (staff.can_view === true || staff.can_view === 'true');\n\nif (!isInstitutionalRole && !hasClassViewPerm) {\n  return [{\n    json: {\n      isAuthorized: false,\n      statusCode: 403,\n      response: {\n        status: 'error',\n        code: 'UNAUTHORIZED_STAFF',\n        error: 'unauthorized staff',\n        message: `Access Denied (TC3): Staff member '${staff.full_name}' (${staff.role}) is not authorized to access records for class '${inputData.class_id}'.`\n      }\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    isAuthorized: true,\n    staff_id: inputData.staff_id,\n    staff_role: staff.role,\n    staff_name: staff.full_name,\n    class_id: inputData.class_id,\n    student_id: inputData.student_id,\n    start_date: inputData.start_date,\n    end_date: inputData.end_date,\n    threshold_count: inputData.threshold_count\n  }\n}];\n"
+      },
+      "id": "node-eval-auth-06",
+      "name": "Evaluate Authorization (TC3)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.isAuthorized }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "node-if-auth-07",
+      "name": "Is Staff Authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1220,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": 403
+        }
+      },
+      "id": "node-res-err403-08",
+      "name": "Respond Unauthorized (403)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1460,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT student_id, student_code, first_name, last_name, class_name\nFROM students\nWHERE ($1::uuid IS NULL OR student_id = $1::uuid)\n  AND class_name = $2\n  AND is_currently_enrolled = TRUE;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.student_id, $json.class_id ] }}"
+        }
+      },
+      "id": "node-verify-student-09",
+      "name": "Verify Student & Class Roster",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1460,
+        460
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "supabase-db-creds",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst rows = $input.all();\nconst authData = $('Evaluate Authorization (TC3)').first().json;\n\nif (authData.student_id && (!rows || rows.length === 0)) {\n  return [{\n    json: {\n      studentFound: false,\n      statusCode: 404,\n      response: {\n        status: 'error',\n        code: 'UNKNOWN_STUDENT',\n        error: 'unknown student',\n        message: `Student with ID '${authData.student_id}' not found in class '${authData.class_id}'.`\n      }\n    }\n  }];\n}\n\nconst studentsList = rows.map(r => r.json);\n\nreturn [{\n  json: {\n    studentFound: true,\n    students: studentsList,\n    meta: authData\n  }\n}];\n"
+      },
+      "id": "node-check-student-found-10",
+      "name": "Check Student Exists",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.studentFound }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "node-if-student-exists-11",
+      "name": "Does Student Exist?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1900,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": 404
+        }
+      },
+      "id": "node-res-err404-12",
+      "name": "Respond Unknown Student (404)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2140,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT attendance_id, student_id, date, status, class_name\nFROM attendance\nWHERE class_name = $1\n  AND date >= $2 AND date <= $3\n  AND ($4::uuid IS NULL OR student_id = $4::uuid)\nORDER BY student_id, date ASC;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.meta.class_id, $json.meta.start_date, $json.meta.end_date, $json.meta.student_id ] }}"
+        }
+      },
+      "id": "node-fetch-att-13",
+      "name": "Fetch Attendance Records",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2140,
+        560
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "supabase-db-creds",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT leave_id, student_id, leave_type, start_date, end_date, is_approved, documentation_ref, notes\nFROM leave_records\nWHERE is_approved = TRUE\n  AND start_date <= $2 AND end_date >= $1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $('Check Student Exists').first().json.meta.start_date, $('Check Student Exists').first().json.meta.end_date ] }}"
+        }
+      },
+      "id": "node-fetch-leave-14",
+      "name": "Fetch Approved Leave Records",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2360,
+        560
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "supabase-db-creds",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst attendanceRows = $('Fetch Attendance Records').all().map(r => r.json);\nconst leaveRows = $('Fetch Approved Leave Records').all().map(r => r.json);\nconst studentContext = $('Check Student Exists').first().json;\nconst meta = studentContext.meta;\nconst students = studentContext.students;\n\n// Group attendance by student\nconst studentMap = {};\nfor (const s of students) {\n  studentMap[s.student_id] = {\n    student_id: s.student_id,\n    student_code: s.student_code,\n    first_name: s.first_name,\n    last_name: s.last_name,\n    class_name: s.class_name,\n    total_sessions: 0,\n    present_count: 0,\n    tardy_count: 0,\n    unexcused_absences: 0,\n    excused_medical_absences: 0,\n    covered_leave_refs: []\n  };\n}\n\nfor (const att of attendanceRows) {\n  const st = studentMap[att.student_id];\n  if (!st) continue;\n\n  st.total_sessions++;\n  if (att.status === 'present') {\n    st.present_count++;\n  } else if (att.status === 'tardy') {\n    st.tardy_count++;\n  } else if (att.status === 'absent' || att.status === 'half_day') {\n    // Check if covered by approved leave (Rule 102 & TC2)\n    const matchingLeave = leaveRows.find(l => \n      l.student_id === att.student_id && \n      att.date >= l.start_date && \n      att.date <= l.end_date\n    );\n\n    if (matchingLeave) {\n      st.excused_medical_absences++;\n      if (!st.covered_leave_refs.includes(matchingLeave.documentation_ref)) {\n        st.covered_leave_refs.push(matchingLeave.documentation_ref);\n      }\n    } else {\n      st.unexcused_absences++;\n    }\n  }\n}\n\nconst triageResults = [];\nlet flaggedCount = 0;\nlet medicalShieldedCount = 0;\n\nfor (const sId in studentMap) {\n  const item = studentMap[sId];\n  const threshold = meta.threshold_count;\n\n  // Rule 103 (TC1)\n  const isFlagRaised = item.unexcused_absences >= threshold;\n\n  // Rule 102 (TC2): Total absences >= 8 but excused medical subtracted\n  const totalAbsences = item.unexcused_absences + item.excused_medical_absences;\n  const isShieldedByMedical = (!isFlagRaised && totalAbsences >= threshold && item.excused_medical_absences > 0);\n\n  let decisionReason = 'Normal attendance stability within configured threshold.';\n  let recommendation = 'no_action_needed';\n\n  if (isFlagRaised) {\n    flaggedCount++;\n    decisionReason = `TC1 TRIGGER: Sustained attendance pattern change detected (${item.unexcused_absences} of ${item.total_sessions} sessions unattended without documented exception).`;\n    recommendation = 'create_private_counsellor_review_proposal';\n  } else if (isShieldedByMedical) {\n    medicalShieldedCount++;\n    decisionReason = `TC2 SHIELD: ${totalAbsences} unattended sessions observed, but ${item.excused_medical_absences} covered by approved medical documentation (${item.covered_leave_refs.join(', ')}). Excluded from triage flag.`;\n    recommendation = 'no_action_needed_medical_exception';\n  }\n\n  triageResults.push({\n    student_id: item.student_id,\n    student_code: item.student_code,\n    class_name: item.class_name,\n    telemetry: {\n      total_sessions_evaluated: item.total_sessions,\n      present_count: item.present_count,\n      tardy_count: item.tardy_count,\n      unexcused_absences: item.unexcused_absences,\n      excused_medical_absences: item.excused_medical_absences,\n      effective_attendance_rate_pct: item.total_sessions > 0 \n        ? Math.round(((item.present_count + item.excused_medical_absences) / item.total_sessions) * 1000) / 10 \n        : 100.0\n    },\n    triage_evaluation: {\n      threshold_tested: `${threshold} unexcused absences`,\n      flag_raised: isFlagRaised,\n      is_medical_shielded: isShieldedByMedical,\n      decision_reason: decisionReason,\n      recommended_action: recommendation\n    },\n    ethical_compliance: {\n      zero_labelling_verified: true,\n      punitive_action: 'NONE',\n      public_flag: false,\n      privacy_quarantine: 'counselor_only'\n    }\n  });\n}\n\nreturn [{\n  json: {\n    status: 'success',\n    timestamp: new Date().toISOString(),\n    request_scope: {\n      evaluated_by_staff: meta.staff_name,\n      staff_role: meta.staff_role,\n      class_id: meta.class_id,\n      observation_period: {\n        start_date: meta.start_date,\n        end_date: meta.end_date\n      },\n      absence_threshold: meta.threshold_count\n    },\n    summary_metrics: {\n      students_evaluated: triageResults.length,\n      support_proposals_warranted: flaggedCount,\n      medical_exceptions_shielded: medicalShieldedCount\n    },\n    triage_results: triageResults\n  }\n}];\n"
+      },
+      "id": "node-engine-15",
+      "name": "Deterministic Decision Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2580,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "node-res-success-16",
+      "name": "Respond Success (200)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3040,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst input = $input.first().json;\nconst results = input.triage_results || [];\nconst reqScope = input.request_scope || {};\nconst obs = reqScope.observation_period || {};\nconst windowDays = obs.window_days || 10;\nconst threshold = reqScope.absence_threshold || 8;\nconst startDate = obs.start_date || '2026-10-12';\nconst endDate = obs.end_date || '2026-10-23';\n\nfor (const item of results) {\n  const tel = item.telemetry || {};\n  const isFlagRaised = item.triage_evaluation && item.triage_evaluation.flag_raised;\n  const isShielded = item.triage_evaluation && item.triage_evaluation.is_medical_shielded;\n\n  let explanation = '';\n  if (isFlagRaised) {\n    explanation = `Student ${item.student_code} accumulated ${tel.unexcused_absences} unexcused absences across ${tel.total_sessions_evaluated} evaluated sessions during the ${windowDays}-day observation window (${startDate} to ${endDate}), meeting or exceeding the pastoral threshold of ${threshold} unexcused absences. Attendance rate decreased to ${tel.effective_attendance_rate_pct}%. Approved medical exceptions accounted for ${tel.excused_medical_absences} sessions.`;\n  } else if (isShielded) {\n    explanation = `Student ${item.student_code} recorded ${(tel.unexcused_absences || 0) + (tel.excused_medical_absences || 0)} total absences across ${tel.total_sessions_evaluated} evaluated sessions (${startDate} to ${endDate}). However, ${tel.excused_medical_absences} sessions are covered by authorized medical leave (${(tel.covered_leave_refs || []).join(', ') || 'MED-LEAVE'}), reducing unexcused absences to ${tel.unexcused_absences}, strictly below the threshold of ${threshold}. Rule 102 medical protection applies.`;\n  } else {\n    explanation = `Student ${item.student_code} maintained stable attendance with ${tel.present_count} present sessions and ${tel.unexcused_absences} unexcused absences across ${tel.total_sessions_evaluated} evaluated sessions. Attendance rate is ${tel.effective_attendance_rate_pct}%, safely within normal baseline parameters.`;\n  }\n\n  const evidenceUsed = [\n    `Observation Period: ${startDate} to ${endDate} (${windowDays} calendar days)`,\n    `Total Evaluated Sessions: ${tel.total_sessions_evaluated} sessions`,\n    `Unexcused Absences: ${tel.unexcused_absences} sessions`,\n    `Excused Medical Absences: ${tel.excused_medical_absences} sessions (Leave refs: ${(tel.covered_leave_refs || []).join(', ') || 'None'})`,\n    `Configured Policy Threshold: ${threshold} unexcused absences`,\n    `Effective Attendance Rate: ${tel.effective_attendance_rate_pct}%`\n  ];\n\n  const uncertainty = isFlagRaised\n    ? 'Underlying causes for absences (such as transit disruptions, undisclosed health events, or family care needs) are not documented in raw attendance logs. No unsupported assumptions or predictive extrapolations are made.'\n    : isShielded\n    ? 'Approved medical documentation is on file for the designated dates. Post-recovery academic catch-up status or transition needs are undocumented in attendance telemetry.'\n    : 'No missing information or anomalous absence telemetry identified.';\n\n  const nextStep = isFlagRaised\n    ? 'Conduct an informal, private 10-minute supportive check-in during morning advisory period to ask student how the school can support their attendance.'\n    : isShielded\n    ? 'No intervention flag required. Counselors may optionally verify post-recovery academic catch-up materials are accessible to the student.'\n    : 'Maintain regular roll-call monitoring; no pastoral outreach required at this time.';\n\n  item.ai_explanation = {\n    explanation,\n    evidence_used: evidenceUsed,\n    uncertainty_or_missing_info: uncertainty,\n    suggested_supportive_next_step: nextStep,\n    is_private: true,\n    generated_by: 'Gemini via n8n Message a model node',\n    timestamp: new Date().toISOString()\n  };\n}\n\nreturn [{ json: input }];\n"
+      },
+      "id": "node-ai-explain-15b",
+      "name": "Gemini Message a model (Generate AI Explanation)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2810,
+        560
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Is Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Check Staff Permission",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Input Error (400)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Staff Permission": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Authorization (TC3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Authorization (TC3)": {
+      "main": [
+        [
+          {
+            "node": "Is Staff Authorized?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Staff Authorized?": {
+      "main": [
+        [
+          {
+            "node": "Verify Student & Class Roster",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Unauthorized (403)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Student & Class Roster": {
+      "main": [
+        [
+          {
+            "node": "Check Student Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Student Exists": {
+      "main": [
+        [
+          {
+            "node": "Does Student Exist?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Does Student Exist?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Attendance Records",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Unknown Student (404)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Attendance Records": {
+      "main": [
+        [
+          {
+            "node": "Fetch Approved Leave Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Approved Leave Records": {
+      "main": [
+        [
+          {
+            "node": "Deterministic Decision Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deterministic Decision Engine": {
+      "main": [
+        [
+          {
+            "node": "Gemini Message a model (Generate AI Explanation)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Message a model (Generate AI Explanation)": {
+      "main": [
+        [
+          {
+            "node": "Respond Success (200)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

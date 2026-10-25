@@ -1,0 +1,615 @@
+-- =====================================================================
+-- CARE-TRIAGE: FULL CONSOLIDATED SETUP SCRIPT FOR SUPABASE
+-- Run this directly in your Supabase Dashboard: SQL Editor -> New Query
+-- =====================================================================
+
+-- 1. EXTENSIONS & ENUMS
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+DO $$ BEGIN
+    CREATE TYPE staff_role_type AS ENUM ('counselor', 'teacher', 'admin', 'support_lead');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE attendance_status_type AS ENUM ('present', 'absent', 'tardy', 'half_day');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE leave_category_type AS ENUM ('medical_leave', 'bereavement', 'school_activity', 'family_emergency');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE proposal_status_type AS ENUM ('pending_approval', 'approved', 'dismissed', 'action_executed', 'verified_completed');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE review_action_type AS ENUM ('supportive_counselor_checkin', 'pastoral_family_outreach', 'academic_catchup_plan', 'dismissed_no_action');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE test_execution_status AS ENUM ('idle', 'running', 'passed', 'failed');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+-- 2. TABLES
+CREATE TABLE IF NOT EXISTS staff (
+    staff_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    auth_user_id UUID UNIQUE REFERENCES auth.users(id) ON DELETE SET NULL,
+    email TEXT NOT NULL UNIQUE,
+    full_name TEXT NOT NULL,
+    role staff_role_type NOT NULL DEFAULT 'teacher',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS staff_permissions (
+    permission_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    staff_id UUID NOT NULL REFERENCES staff(staff_id) ON DELETE CASCADE,
+    class_name TEXT NOT NULL,
+    can_view BOOLEAN NOT NULL DEFAULT TRUE,
+    can_edit BOOLEAN NOT NULL DEFAULT FALSE,
+    granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(staff_id, class_name)
+);
+
+CREATE TABLE IF NOT EXISTS students (
+    student_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_code TEXT NOT NULL UNIQUE,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    class_name TEXT NOT NULL,
+    grade_level TEXT NOT NULL,
+    baseline_attendance_rate NUMERIC(5,2) NOT NULL DEFAULT 95.00 CHECK (baseline_attendance_rate >= 0 AND baseline_attendance_rate <= 100),
+    is_currently_enrolled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS attendance (
+    attendance_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id UUID NOT NULL REFERENCES students(student_id) ON DELETE CASCADE,
+    date DATE NOT NULL,
+    status attendance_status_type NOT NULL,
+    class_name TEXT NOT NULL,
+    recorded_by UUID REFERENCES staff(staff_id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(student_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS leave_records (
+    leave_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id UUID NOT NULL REFERENCES students(student_id) ON DELETE CASCADE,
+    leave_type leave_category_type NOT NULL,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    is_approved BOOLEAN NOT NULL DEFAULT TRUE,
+    documentation_ref TEXT NOT NULL,
+    approved_by UUID REFERENCES staff(staff_id) ON DELETE SET NULL,
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT valid_date_range CHECK (end_date >= start_date)
+);
+
+CREATE TABLE IF NOT EXISTS review_proposals (
+    proposal_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id UUID NOT NULL REFERENCES students(student_id) ON DELETE CASCADE,
+    class_name TEXT NOT NULL,
+    window_start DATE NOT NULL,
+    window_end DATE NOT NULL,
+    total_window_days INT NOT NULL DEFAULT 10 CHECK (total_window_days > 0),
+    unexcused_absences INT NOT NULL CHECK (unexcused_absences >= 0),
+    excused_absences INT NOT NULL DEFAULT 0 CHECK (excused_absences >= 0),
+    reason TEXT NOT NULL,
+    evidence JSONB NOT NULL,
+    ai_support_context JSONB,
+    status proposal_status_type NOT NULL DEFAULT 'pending_approval',
+    triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reviewed_at TIMESTAMPTZ,
+    reviewed_by UUID REFERENCES staff(staff_id) ON DELETE SET NULL,
+    dismissal_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS counsellor_reviews (
+    review_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    proposal_id UUID NOT NULL REFERENCES review_proposals(proposal_id) ON DELETE CASCADE,
+    student_id UUID NOT NULL REFERENCES students(student_id) ON DELETE CASCADE,
+    counsellor_id UUID NOT NULL REFERENCES staff(staff_id) ON DELETE RESTRICT,
+    action_type review_action_type NOT NULL DEFAULT 'supportive_counselor_checkin',
+    scheduled_checkin_date DATE NOT NULL,
+    completed_at TIMESTAMPTZ,
+    pastoral_outcome_notes TEXT,
+    verification_status TEXT NOT NULL DEFAULT 'awaiting_encounter' CHECK (verification_status IN ('awaiting_encounter', 'verified_completed', 'overdue_unverified')),
+    verified_at TIMESTAMPTZ,
+    verification_evidence JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    log_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    actor TEXT NOT NULL,
+    actor_role TEXT NOT NULL,
+    action TEXT NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    result TEXT NOT NULL,
+    related_entity TEXT NOT NULL,
+    related_record_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS test_runs (
+    test_run_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    test_case TEXT NOT NULL,
+    test_title TEXT NOT NULL,
+    expected_result TEXT NOT NULL,
+    actual_result TEXT,
+    status test_execution_status NOT NULL DEFAULT 'idle',
+    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    execution_logs TEXT[] DEFAULT ARRAY[]::TEXT[],
+    executed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 3. INDEXES
+CREATE INDEX IF NOT EXISTS idx_attendance_student_date ON attendance(student_id, date);
+CREATE INDEX IF NOT EXISTS idx_attendance_class_name ON attendance(class_name);
+CREATE INDEX IF NOT EXISTS idx_leave_records_student_dates ON leave_records(student_id, start_date, end_date);
+CREATE INDEX IF NOT EXISTS idx_staff_permissions_staff ON staff_permissions(staff_id, class_name);
+CREATE INDEX IF NOT EXISTS idx_review_proposals_student ON review_proposals(student_id);
+CREATE INDEX IF NOT EXISTS idx_review_proposals_status ON review_proposals(status);
+CREATE INDEX IF NOT EXISTS idx_counsellor_reviews_proposal ON counsellor_reviews(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
+
+-- 4. ROW-LEVEL SECURITY (RLS)
+ALTER TABLE staff ENABLE ROW LEVEL SECURITY;
+ALTER TABLE staff_permissions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE students ENABLE ROW LEVEL SECURITY;
+ALTER TABLE attendance ENABLE ROW LEVEL SECURITY;
+ALTER TABLE leave_records ENABLE ROW LEVEL SECURITY;
+ALTER TABLE review_proposals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE counsellor_reviews ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE test_runs ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION get_current_staff_id()
+RETURNS UUID AS $$
+    SELECT staff_id FROM staff WHERE auth_user_id = auth.uid() LIMIT 1;
+$$ LANGUAGE sql STABLE SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION get_current_staff_role()
+RETURNS staff_role_type AS $$
+    SELECT role FROM staff WHERE auth_user_id = auth.uid() LIMIT 1;
+$$ LANGUAGE sql STABLE SECURITY DEFINER;
+
+-- Attendance Policy (TC3)
+DROP POLICY IF EXISTS policy_attendance_select ON attendance;
+CREATE POLICY policy_attendance_select ON attendance
+    FOR SELECT USING (
+        get_current_staff_role() IN ('counselor', 'admin', 'support_lead')
+        OR
+        class_name IN (
+            SELECT sp.class_name FROM staff_permissions sp
+            WHERE sp.staff_id = get_current_staff_id() AND sp.can_view = TRUE
+        )
+    );
+
+-- Proposals Policy (TC4 & Confidentiality)
+DROP POLICY IF EXISTS policy_proposals_counselor_only ON review_proposals;
+CREATE POLICY policy_proposals_counselor_only ON review_proposals
+    FOR ALL USING (
+        get_current_staff_role() IN ('counselor', 'admin', 'support_lead')
+    );
+
+-- Counsellor Reviews Policy
+DROP POLICY IF EXISTS policy_counsellor_reviews_access ON counsellor_reviews;
+CREATE POLICY policy_counsellor_reviews_access ON counsellor_reviews
+    FOR ALL USING (
+        get_current_staff_role() IN ('counselor', 'admin', 'support_lead')
+    );
+
+-- Audit Logs Policy
+DROP POLICY IF EXISTS policy_audit_logs_select ON audit_logs;
+CREATE POLICY policy_audit_logs_select ON audit_logs
+    FOR SELECT USING (
+        get_current_staff_role() IN ('admin', 'counselor', 'support_lead')
+    );
+
+DROP POLICY IF EXISTS policy_audit_logs_insert ON audit_logs;
+CREATE POLICY policy_audit_logs_insert ON audit_logs
+    FOR INSERT WITH CHECK (TRUE);
+
+-- Test Runs Policy
+DROP POLICY IF EXISTS policy_test_runs_all ON test_runs;
+CREATE POLICY policy_test_runs_all ON test_runs
+    FOR ALL USING (TRUE);
+
+-- 5. SYNTHETIC SEED DATA (30 Students, 3 Classes, 5 Staff, 300 Attendance Records)
+-- =====================================================================
+-- CARE-TRIAGE: COMPREHENSIVE SYNTHETIC SEED DATASET
+-- 30 Students across 10A, 10B, 10C, 5 Staff, 300 Attendance Records
+-- Contains TC1, TC2, TC3, and TC4 test scenarios
+-- =====================================================================
+
+-- 1. STAFF
+INSERT INTO staff (staff_id, email, full_name, role) VALUES ('11111111-1111-1111-1111-111111111111', 'eleanor.vance@school.edu', 'Eleanor Vance, M.Ed.', 'counselor') ON CONFLICT (email) DO NOTHING;
+INSERT INTO staff (staff_id, email, full_name, role) VALUES ('22222222-2222-2222-2222-222222222222', 'sarah.davis@school.edu', 'Sarah Davis', 'teacher') ON CONFLICT (email) DO NOTHING;
+INSERT INTO staff (staff_id, email, full_name, role) VALUES ('33333333-3333-3333-3333-333333333333', 'marcus.brown@school.edu', 'Marcus Brown', 'teacher') ON CONFLICT (email) DO NOTHING;
+INSERT INTO staff (staff_id, email, full_name, role) VALUES ('44444444-4444-4444-4444-444444444444', 'chloe.zhao@school.edu', 'Chloe Zhao', 'teacher') ON CONFLICT (email) DO NOTHING;
+INSERT INTO staff (staff_id, email, full_name, role) VALUES ('55555555-5555-5555-5555-555555555555', 'admin.hastings@school.edu', 'Principal Arthur Hastings', 'admin') ON CONFLICT (email) DO NOTHING;
+
+-- 2. STAFF PERMISSIONS
+INSERT INTO staff_permissions (permission_id, staff_id, class_name, can_view, can_edit) VALUES ('p1111111-0000-0000-0000-000000000001', '22222222-2222-2222-2222-222222222222', '10A', TRUE, TRUE) ON CONFLICT (staff_id, class_name) DO NOTHING;
+INSERT INTO staff_permissions (permission_id, staff_id, class_name, can_view, can_edit) VALUES ('p2222222-0000-0000-0000-000000000002', '33333333-3333-3333-3333-333333333333', '10B', TRUE, TRUE) ON CONFLICT (staff_id, class_name) DO NOTHING;
+INSERT INTO staff_permissions (permission_id, staff_id, class_name, can_view, can_edit) VALUES ('p3333333-0000-0000-0000-000000000003', '44444444-4444-4444-4444-444444444444', '10C', TRUE, TRUE) ON CONFLICT (staff_id, class_name) DO NOTHING;
+
+-- 3. STUDENTS (30 Students)
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000001', 'STU-2026-001', 'Alex', 'Rivera', '10A', '10', 95.8) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000002', 'STU-2026-002', 'Jordan', 'Chen', '10A', '10', 98.2) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000003', 'STU-2026-003', 'Casey', 'Williams', '10A', '10', 95.6) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000004', 'STU-2026-004', 'Dakota', 'Miller', '10A', '10', 96.4) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000005', 'STU-2026-005', 'Jamie', 'Davis', '10A', '10', 97.2) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000006', 'STU-2026-006', 'Riley', 'Wilson', '10A', '10', 94.0) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000007', 'STU-2026-007', 'Morgan', 'Martinez', '10A', '10', 94.8) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000008', 'STU-2026-008', 'Skyler', 'Anderson', '10A', '10', 95.6) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000009', 'STU-2026-009', 'Rowan', 'Taylor', '10A', '10', 96.4) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000010', 'STU-2026-010', 'Reese', 'Thomas', '10A', '10', 97.2) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000011', 'STU-2026-011', 'Taylor', 'Patel', '10B', '10', 92.4) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000012', 'STU-2026-012', 'Avery', 'Jackson', '10B', '10', 93.7) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000013', 'STU-2026-013', 'Cameron', 'White', '10B', '10', 94.4) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000014', 'STU-2026-014', 'Quinn', 'Harris', '10B', '10', 95.1) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000015', 'STU-2026-015', 'Parker', 'Martin', '10B', '10', 95.8) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000016', 'STU-2026-016', 'Hayden', 'Thompson', '10B', '10', 96.5) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000017', 'STU-2026-017', 'Logan', 'Garcia', '10B', '10', 93.0) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000018', 'STU-2026-018', 'Kendall', 'Martinez', '10B', '10', 93.7) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000019', 'STU-2026-019', 'Emerson', 'Robinson', '10B', '10', 94.4) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000020', 'STU-2026-020', 'Finley', 'Clark', '10B', '10', 95.1) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000021', 'STU-2026-021', 'Sam', 'Kim', '10C', '10', 96.0) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000022', 'STU-2026-022', 'Eden', 'Rodriguez', '10C', '10', 96.8) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000023', 'STU-2026-023', 'Kai', 'Lewis', '10C', '10', 97.6) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000024', 'STU-2026-024', 'Harper', 'Lee', '10C', '10', 98.4) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000025', 'STU-2026-025', 'Sage', 'Walker', '10C', '10', 96.0) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000026', 'STU-2026-026', 'Amari', 'Hall', '10C', '10', 96.8) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000027', 'STU-2026-027', 'Peyton', 'Allen', '10C', '10', 97.6) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000028', 'STU-2026-028', 'Adrian', 'Young', '10C', '10', 98.4) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000029', 'STU-2026-029', 'Blake', 'Hernandez', '10C', '10', 96.0) ON CONFLICT (student_code) DO NOTHING;
+INSERT INTO students (student_id, student_code, first_name, last_name, class_name, grade_level, baseline_attendance_rate) VALUES ('a0000000-0000-0000-0000-000000000030', 'STU-2026-030', 'Charlie', 'King', '10C', '10', 96.8) ON CONFLICT (student_code) DO NOTHING;
+
+-- 4. APPROVED LEAVE RECORDS
+INSERT INTO leave_records (leave_id, student_id, leave_type, start_date, end_date, is_approved, documentation_ref, approved_by, notes) VALUES ('b0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002', 'medical_leave', '2026-10-13', '2026-10-21', TRUE, 'DOC-MED-84920', '11111111-1111-1111-1111-111111111111', 'Pediatric specialist post-surgical recovery certificate. Approved supportive home transition.') ON CONFLICT (leave_id) DO NOTHING;
+INSERT INTO leave_records (leave_id, student_id, leave_type, start_date, end_date, is_approved, documentation_ref, approved_by, notes) VALUES ('b0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000022', 'school_activity', '2026-10-22', '2026-10-23', TRUE, 'DOC-ACT-99104', '55555555-5555-5555-5555-555555555555', 'State STEM Olympiad delegation competition.') ON CONFLICT (leave_id) DO NOTHING;
+
+-- 5. ATTENDANCE RECORDS (300 Records over 10 School Days)
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001', '2026-10-12', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000001', '2026-10-13', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000001', '2026-10-14', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000004', 'a0000000-0000-0000-0000-000000000001', '2026-10-15', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000005', 'a0000000-0000-0000-0000-000000000001', '2026-10-16', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000006', 'a0000000-0000-0000-0000-000000000001', '2026-10-19', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000007', 'a0000000-0000-0000-0000-000000000001', '2026-10-20', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000008', 'a0000000-0000-0000-0000-000000000001', '2026-10-21', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000009', 'a0000000-0000-0000-0000-000000000001', '2026-10-22', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000010', 'a0000000-0000-0000-0000-000000000001', '2026-10-23', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000011', 'a0000000-0000-0000-0000-000000000002', '2026-10-12', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000012', 'a0000000-0000-0000-0000-000000000002', '2026-10-13', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000013', 'a0000000-0000-0000-0000-000000000002', '2026-10-14', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000014', 'a0000000-0000-0000-0000-000000000002', '2026-10-15', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000015', 'a0000000-0000-0000-0000-000000000002', '2026-10-16', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000016', 'a0000000-0000-0000-0000-000000000002', '2026-10-19', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000017', 'a0000000-0000-0000-0000-000000000002', '2026-10-20', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000018', 'a0000000-0000-0000-0000-000000000002', '2026-10-21', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000019', 'a0000000-0000-0000-0000-000000000002', '2026-10-22', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000020', 'a0000000-0000-0000-0000-000000000002', '2026-10-23', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000021', 'a0000000-0000-0000-0000-000000000003', '2026-10-12', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000022', 'a0000000-0000-0000-0000-000000000003', '2026-10-13', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000023', 'a0000000-0000-0000-0000-000000000003', '2026-10-14', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000024', 'a0000000-0000-0000-0000-000000000003', '2026-10-15', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000025', 'a0000000-0000-0000-0000-000000000003', '2026-10-16', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000026', 'a0000000-0000-0000-0000-000000000003', '2026-10-19', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000027', 'a0000000-0000-0000-0000-000000000003', '2026-10-20', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000028', 'a0000000-0000-0000-0000-000000000003', '2026-10-21', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000029', 'a0000000-0000-0000-0000-000000000003', '2026-10-22', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000030', 'a0000000-0000-0000-0000-000000000003', '2026-10-23', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000031', 'a0000000-0000-0000-0000-000000000004', '2026-10-12', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000032', 'a0000000-0000-0000-0000-000000000004', '2026-10-13', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000033', 'a0000000-0000-0000-0000-000000000004', '2026-10-14', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000034', 'a0000000-0000-0000-0000-000000000004', '2026-10-15', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000035', 'a0000000-0000-0000-0000-000000000004', '2026-10-16', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000036', 'a0000000-0000-0000-0000-000000000004', '2026-10-19', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000037', 'a0000000-0000-0000-0000-000000000004', '2026-10-20', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000038', 'a0000000-0000-0000-0000-000000000004', '2026-10-21', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000039', 'a0000000-0000-0000-0000-000000000004', '2026-10-22', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000040', 'a0000000-0000-0000-0000-000000000004', '2026-10-23', 'tardy', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000041', 'a0000000-0000-0000-0000-000000000005', '2026-10-12', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000042', 'a0000000-0000-0000-0000-000000000005', '2026-10-13', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000043', 'a0000000-0000-0000-0000-000000000005', '2026-10-14', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000044', 'a0000000-0000-0000-0000-000000000005', '2026-10-15', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000045', 'a0000000-0000-0000-0000-000000000005', '2026-10-16', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000046', 'a0000000-0000-0000-0000-000000000005', '2026-10-19', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000047', 'a0000000-0000-0000-0000-000000000005', '2026-10-20', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000048', 'a0000000-0000-0000-0000-000000000005', '2026-10-21', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000049', 'a0000000-0000-0000-0000-000000000005', '2026-10-22', 'tardy', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000050', 'a0000000-0000-0000-0000-000000000005', '2026-10-23', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000051', 'a0000000-0000-0000-0000-000000000006', '2026-10-12', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000052', 'a0000000-0000-0000-0000-000000000006', '2026-10-13', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000053', 'a0000000-0000-0000-0000-000000000006', '2026-10-14', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000054', 'a0000000-0000-0000-0000-000000000006', '2026-10-15', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000055', 'a0000000-0000-0000-0000-000000000006', '2026-10-16', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000056', 'a0000000-0000-0000-0000-000000000006', '2026-10-19', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000057', 'a0000000-0000-0000-0000-000000000006', '2026-10-20', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000058', 'a0000000-0000-0000-0000-000000000006', '2026-10-21', 'tardy', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000059', 'a0000000-0000-0000-0000-000000000006', '2026-10-22', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000060', 'a0000000-0000-0000-0000-000000000006', '2026-10-23', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000061', 'a0000000-0000-0000-0000-000000000007', '2026-10-12', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000062', 'a0000000-0000-0000-0000-000000000007', '2026-10-13', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000063', 'a0000000-0000-0000-0000-000000000007', '2026-10-14', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000064', 'a0000000-0000-0000-0000-000000000007', '2026-10-15', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000065', 'a0000000-0000-0000-0000-000000000007', '2026-10-16', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000066', 'a0000000-0000-0000-0000-000000000007', '2026-10-19', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000067', 'a0000000-0000-0000-0000-000000000007', '2026-10-20', 'tardy', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000068', 'a0000000-0000-0000-0000-000000000007', '2026-10-21', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000069', 'a0000000-0000-0000-0000-000000000007', '2026-10-22', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000070', 'a0000000-0000-0000-0000-000000000007', '2026-10-23', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000071', 'a0000000-0000-0000-0000-000000000008', '2026-10-12', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000072', 'a0000000-0000-0000-0000-000000000008', '2026-10-13', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000073', 'a0000000-0000-0000-0000-000000000008', '2026-10-14', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000074', 'a0000000-0000-0000-0000-000000000008', '2026-10-15', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000075', 'a0000000-0000-0000-0000-000000000008', '2026-10-16', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000076', 'a0000000-0000-0000-0000-000000000008', '2026-10-19', 'tardy', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000077', 'a0000000-0000-0000-0000-000000000008', '2026-10-20', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000078', 'a0000000-0000-0000-0000-000000000008', '2026-10-21', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000079', 'a0000000-0000-0000-0000-000000000008', '2026-10-22', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000080', 'a0000000-0000-0000-0000-000000000008', '2026-10-23', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000081', 'a0000000-0000-0000-0000-000000000009', '2026-10-12', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000082', 'a0000000-0000-0000-0000-000000000009', '2026-10-13', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000083', 'a0000000-0000-0000-0000-000000000009', '2026-10-14', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000084', 'a0000000-0000-0000-0000-000000000009', '2026-10-15', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000085', 'a0000000-0000-0000-0000-000000000009', '2026-10-16', 'tardy', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000086', 'a0000000-0000-0000-0000-000000000009', '2026-10-19', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000087', 'a0000000-0000-0000-0000-000000000009', '2026-10-20', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000088', 'a0000000-0000-0000-0000-000000000009', '2026-10-21', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000089', 'a0000000-0000-0000-0000-000000000009', '2026-10-22', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000090', 'a0000000-0000-0000-0000-000000000009', '2026-10-23', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000091', 'a0000000-0000-0000-0000-000000000010', '2026-10-12', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000092', 'a0000000-0000-0000-0000-000000000010', '2026-10-13', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000093', 'a0000000-0000-0000-0000-000000000010', '2026-10-14', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000094', 'a0000000-0000-0000-0000-000000000010', '2026-10-15', 'tardy', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000095', 'a0000000-0000-0000-0000-000000000010', '2026-10-16', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000096', 'a0000000-0000-0000-0000-000000000010', '2026-10-19', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000097', 'a0000000-0000-0000-0000-000000000010', '2026-10-20', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000098', 'a0000000-0000-0000-0000-000000000010', '2026-10-21', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000099', 'a0000000-0000-0000-0000-000000000010', '2026-10-22', 'present', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000100', 'a0000000-0000-0000-0000-000000000010', '2026-10-23', 'absent', '10A') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000101', 'a0000000-0000-0000-0000-000000000011', '2026-10-12', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000102', 'a0000000-0000-0000-0000-000000000011', '2026-10-13', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000103', 'a0000000-0000-0000-0000-000000000011', '2026-10-14', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000104', 'a0000000-0000-0000-0000-000000000011', '2026-10-15', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000105', 'a0000000-0000-0000-0000-000000000011', '2026-10-16', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000106', 'a0000000-0000-0000-0000-000000000011', '2026-10-19', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000107', 'a0000000-0000-0000-0000-000000000011', '2026-10-20', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000108', 'a0000000-0000-0000-0000-000000000011', '2026-10-21', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000109', 'a0000000-0000-0000-0000-000000000011', '2026-10-22', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000110', 'a0000000-0000-0000-0000-000000000011', '2026-10-23', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000111', 'a0000000-0000-0000-0000-000000000012', '2026-10-12', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000112', 'a0000000-0000-0000-0000-000000000012', '2026-10-13', 'tardy', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000113', 'a0000000-0000-0000-0000-000000000012', '2026-10-14', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000114', 'a0000000-0000-0000-0000-000000000012', '2026-10-15', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000115', 'a0000000-0000-0000-0000-000000000012', '2026-10-16', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000116', 'a0000000-0000-0000-0000-000000000012', '2026-10-19', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000117', 'a0000000-0000-0000-0000-000000000012', '2026-10-20', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000118', 'a0000000-0000-0000-0000-000000000012', '2026-10-21', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000119', 'a0000000-0000-0000-0000-000000000012', '2026-10-22', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000120', 'a0000000-0000-0000-0000-000000000012', '2026-10-23', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000121', 'a0000000-0000-0000-0000-000000000013', '2026-10-12', 'tardy', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000122', 'a0000000-0000-0000-0000-000000000013', '2026-10-13', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000123', 'a0000000-0000-0000-0000-000000000013', '2026-10-14', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000124', 'a0000000-0000-0000-0000-000000000013', '2026-10-15', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000125', 'a0000000-0000-0000-0000-000000000013', '2026-10-16', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000126', 'a0000000-0000-0000-0000-000000000013', '2026-10-19', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000127', 'a0000000-0000-0000-0000-000000000013', '2026-10-20', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000128', 'a0000000-0000-0000-0000-000000000013', '2026-10-21', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000129', 'a0000000-0000-0000-0000-000000000013', '2026-10-22', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000130', 'a0000000-0000-0000-0000-000000000013', '2026-10-23', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000131', 'a0000000-0000-0000-0000-000000000014', '2026-10-12', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000132', 'a0000000-0000-0000-0000-000000000014', '2026-10-13', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000133', 'a0000000-0000-0000-0000-000000000014', '2026-10-14', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000134', 'a0000000-0000-0000-0000-000000000014', '2026-10-15', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000135', 'a0000000-0000-0000-0000-000000000014', '2026-10-16', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000136', 'a0000000-0000-0000-0000-000000000014', '2026-10-19', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000137', 'a0000000-0000-0000-0000-000000000014', '2026-10-20', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000138', 'a0000000-0000-0000-0000-000000000014', '2026-10-21', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000139', 'a0000000-0000-0000-0000-000000000014', '2026-10-22', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000140', 'a0000000-0000-0000-0000-000000000014', '2026-10-23', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000141', 'a0000000-0000-0000-0000-000000000015', '2026-10-12', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000142', 'a0000000-0000-0000-0000-000000000015', '2026-10-13', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000143', 'a0000000-0000-0000-0000-000000000015', '2026-10-14', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000144', 'a0000000-0000-0000-0000-000000000015', '2026-10-15', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000145', 'a0000000-0000-0000-0000-000000000015', '2026-10-16', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000146', 'a0000000-0000-0000-0000-000000000015', '2026-10-19', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000147', 'a0000000-0000-0000-0000-000000000015', '2026-10-20', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000148', 'a0000000-0000-0000-0000-000000000015', '2026-10-21', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000149', 'a0000000-0000-0000-0000-000000000015', '2026-10-22', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000150', 'a0000000-0000-0000-0000-000000000015', '2026-10-23', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000151', 'a0000000-0000-0000-0000-000000000016', '2026-10-12', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000152', 'a0000000-0000-0000-0000-000000000016', '2026-10-13', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000153', 'a0000000-0000-0000-0000-000000000016', '2026-10-14', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000154', 'a0000000-0000-0000-0000-000000000016', '2026-10-15', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000155', 'a0000000-0000-0000-0000-000000000016', '2026-10-16', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000156', 'a0000000-0000-0000-0000-000000000016', '2026-10-19', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000157', 'a0000000-0000-0000-0000-000000000016', '2026-10-20', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000158', 'a0000000-0000-0000-0000-000000000016', '2026-10-21', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000159', 'a0000000-0000-0000-0000-000000000016', '2026-10-22', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000160', 'a0000000-0000-0000-0000-000000000016', '2026-10-23', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000161', 'a0000000-0000-0000-0000-000000000017', '2026-10-12', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000162', 'a0000000-0000-0000-0000-000000000017', '2026-10-13', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000163', 'a0000000-0000-0000-0000-000000000017', '2026-10-14', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000164', 'a0000000-0000-0000-0000-000000000017', '2026-10-15', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000165', 'a0000000-0000-0000-0000-000000000017', '2026-10-16', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000166', 'a0000000-0000-0000-0000-000000000017', '2026-10-19', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000167', 'a0000000-0000-0000-0000-000000000017', '2026-10-20', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000168', 'a0000000-0000-0000-0000-000000000017', '2026-10-21', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000169', 'a0000000-0000-0000-0000-000000000017', '2026-10-22', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000170', 'a0000000-0000-0000-0000-000000000017', '2026-10-23', 'tardy', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000171', 'a0000000-0000-0000-0000-000000000018', '2026-10-12', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000172', 'a0000000-0000-0000-0000-000000000018', '2026-10-13', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000173', 'a0000000-0000-0000-0000-000000000018', '2026-10-14', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000174', 'a0000000-0000-0000-0000-000000000018', '2026-10-15', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000175', 'a0000000-0000-0000-0000-000000000018', '2026-10-16', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000176', 'a0000000-0000-0000-0000-000000000018', '2026-10-19', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000177', 'a0000000-0000-0000-0000-000000000018', '2026-10-20', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000178', 'a0000000-0000-0000-0000-000000000018', '2026-10-21', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000179', 'a0000000-0000-0000-0000-000000000018', '2026-10-22', 'tardy', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000180', 'a0000000-0000-0000-0000-000000000018', '2026-10-23', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000181', 'a0000000-0000-0000-0000-000000000019', '2026-10-12', 'absent', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000182', 'a0000000-0000-0000-0000-000000000019', '2026-10-13', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000183', 'a0000000-0000-0000-0000-000000000019', '2026-10-14', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000184', 'a0000000-0000-0000-0000-000000000019', '2026-10-15', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000185', 'a0000000-0000-0000-0000-000000000019', '2026-10-16', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000186', 'a0000000-0000-0000-0000-000000000019', '2026-10-19', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000187', 'a0000000-0000-0000-0000-000000000019', '2026-10-20', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000188', 'a0000000-0000-0000-0000-000000000019', '2026-10-21', 'tardy', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000189', 'a0000000-0000-0000-0000-000000000019', '2026-10-22', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000190', 'a0000000-0000-0000-0000-000000000019', '2026-10-23', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000191', 'a0000000-0000-0000-0000-000000000020', '2026-10-12', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000192', 'a0000000-0000-0000-0000-000000000020', '2026-10-13', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000193', 'a0000000-0000-0000-0000-000000000020', '2026-10-14', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000194', 'a0000000-0000-0000-0000-000000000020', '2026-10-15', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000195', 'a0000000-0000-0000-0000-000000000020', '2026-10-16', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000196', 'a0000000-0000-0000-0000-000000000020', '2026-10-19', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000197', 'a0000000-0000-0000-0000-000000000020', '2026-10-20', 'tardy', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000198', 'a0000000-0000-0000-0000-000000000020', '2026-10-21', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000199', 'a0000000-0000-0000-0000-000000000020', '2026-10-22', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000200', 'a0000000-0000-0000-0000-000000000020', '2026-10-23', 'present', '10B') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000201', 'a0000000-0000-0000-0000-000000000021', '2026-10-12', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000202', 'a0000000-0000-0000-0000-000000000021', '2026-10-13', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000203', 'a0000000-0000-0000-0000-000000000021', '2026-10-14', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000204', 'a0000000-0000-0000-0000-000000000021', '2026-10-15', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000205', 'a0000000-0000-0000-0000-000000000021', '2026-10-16', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000206', 'a0000000-0000-0000-0000-000000000021', '2026-10-19', 'tardy', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000207', 'a0000000-0000-0000-0000-000000000021', '2026-10-20', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000208', 'a0000000-0000-0000-0000-000000000021', '2026-10-21', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000209', 'a0000000-0000-0000-0000-000000000021', '2026-10-22', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000210', 'a0000000-0000-0000-0000-000000000021', '2026-10-23', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000211', 'a0000000-0000-0000-0000-000000000022', '2026-10-12', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000212', 'a0000000-0000-0000-0000-000000000022', '2026-10-13', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000213', 'a0000000-0000-0000-0000-000000000022', '2026-10-14', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000214', 'a0000000-0000-0000-0000-000000000022', '2026-10-15', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000215', 'a0000000-0000-0000-0000-000000000022', '2026-10-16', 'tardy', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000216', 'a0000000-0000-0000-0000-000000000022', '2026-10-19', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000217', 'a0000000-0000-0000-0000-000000000022', '2026-10-20', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000218', 'a0000000-0000-0000-0000-000000000022', '2026-10-21', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000219', 'a0000000-0000-0000-0000-000000000022', '2026-10-22', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000220', 'a0000000-0000-0000-0000-000000000022', '2026-10-23', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000221', 'a0000000-0000-0000-0000-000000000023', '2026-10-12', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000222', 'a0000000-0000-0000-0000-000000000023', '2026-10-13', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000223', 'a0000000-0000-0000-0000-000000000023', '2026-10-14', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000224', 'a0000000-0000-0000-0000-000000000023', '2026-10-15', 'tardy', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000225', 'a0000000-0000-0000-0000-000000000023', '2026-10-16', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000226', 'a0000000-0000-0000-0000-000000000023', '2026-10-19', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000227', 'a0000000-0000-0000-0000-000000000023', '2026-10-20', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000228', 'a0000000-0000-0000-0000-000000000023', '2026-10-21', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000229', 'a0000000-0000-0000-0000-000000000023', '2026-10-22', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000230', 'a0000000-0000-0000-0000-000000000023', '2026-10-23', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000231', 'a0000000-0000-0000-0000-000000000024', '2026-10-12', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000232', 'a0000000-0000-0000-0000-000000000024', '2026-10-13', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000233', 'a0000000-0000-0000-0000-000000000024', '2026-10-14', 'tardy', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000234', 'a0000000-0000-0000-0000-000000000024', '2026-10-15', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000235', 'a0000000-0000-0000-0000-000000000024', '2026-10-16', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000236', 'a0000000-0000-0000-0000-000000000024', '2026-10-19', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000237', 'a0000000-0000-0000-0000-000000000024', '2026-10-20', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000238', 'a0000000-0000-0000-0000-000000000024', '2026-10-21', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000239', 'a0000000-0000-0000-0000-000000000024', '2026-10-22', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000240', 'a0000000-0000-0000-0000-000000000024', '2026-10-23', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000241', 'a0000000-0000-0000-0000-000000000025', '2026-10-12', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000242', 'a0000000-0000-0000-0000-000000000025', '2026-10-13', 'tardy', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000243', 'a0000000-0000-0000-0000-000000000025', '2026-10-14', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000244', 'a0000000-0000-0000-0000-000000000025', '2026-10-15', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000245', 'a0000000-0000-0000-0000-000000000025', '2026-10-16', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000246', 'a0000000-0000-0000-0000-000000000025', '2026-10-19', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000247', 'a0000000-0000-0000-0000-000000000025', '2026-10-20', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000248', 'a0000000-0000-0000-0000-000000000025', '2026-10-21', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000249', 'a0000000-0000-0000-0000-000000000025', '2026-10-22', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000250', 'a0000000-0000-0000-0000-000000000025', '2026-10-23', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000251', 'a0000000-0000-0000-0000-000000000026', '2026-10-12', 'tardy', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000252', 'a0000000-0000-0000-0000-000000000026', '2026-10-13', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000253', 'a0000000-0000-0000-0000-000000000026', '2026-10-14', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000254', 'a0000000-0000-0000-0000-000000000026', '2026-10-15', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000255', 'a0000000-0000-0000-0000-000000000026', '2026-10-16', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000256', 'a0000000-0000-0000-0000-000000000026', '2026-10-19', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000257', 'a0000000-0000-0000-0000-000000000026', '2026-10-20', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000258', 'a0000000-0000-0000-0000-000000000026', '2026-10-21', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000259', 'a0000000-0000-0000-0000-000000000026', '2026-10-22', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000260', 'a0000000-0000-0000-0000-000000000026', '2026-10-23', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000261', 'a0000000-0000-0000-0000-000000000027', '2026-10-12', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000262', 'a0000000-0000-0000-0000-000000000027', '2026-10-13', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000263', 'a0000000-0000-0000-0000-000000000027', '2026-10-14', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000264', 'a0000000-0000-0000-0000-000000000027', '2026-10-15', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000265', 'a0000000-0000-0000-0000-000000000027', '2026-10-16', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000266', 'a0000000-0000-0000-0000-000000000027', '2026-10-19', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000267', 'a0000000-0000-0000-0000-000000000027', '2026-10-20', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000268', 'a0000000-0000-0000-0000-000000000027', '2026-10-21', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000269', 'a0000000-0000-0000-0000-000000000027', '2026-10-22', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000270', 'a0000000-0000-0000-0000-000000000027', '2026-10-23', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000271', 'a0000000-0000-0000-0000-000000000028', '2026-10-12', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000272', 'a0000000-0000-0000-0000-000000000028', '2026-10-13', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000273', 'a0000000-0000-0000-0000-000000000028', '2026-10-14', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000274', 'a0000000-0000-0000-0000-000000000028', '2026-10-15', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000275', 'a0000000-0000-0000-0000-000000000028', '2026-10-16', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000276', 'a0000000-0000-0000-0000-000000000028', '2026-10-19', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000277', 'a0000000-0000-0000-0000-000000000028', '2026-10-20', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000278', 'a0000000-0000-0000-0000-000000000028', '2026-10-21', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000279', 'a0000000-0000-0000-0000-000000000028', '2026-10-22', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000280', 'a0000000-0000-0000-0000-000000000028', '2026-10-23', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000281', 'a0000000-0000-0000-0000-000000000029', '2026-10-12', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000282', 'a0000000-0000-0000-0000-000000000029', '2026-10-13', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000283', 'a0000000-0000-0000-0000-000000000029', '2026-10-14', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000284', 'a0000000-0000-0000-0000-000000000029', '2026-10-15', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000285', 'a0000000-0000-0000-0000-000000000029', '2026-10-16', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000286', 'a0000000-0000-0000-0000-000000000029', '2026-10-19', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000287', 'a0000000-0000-0000-0000-000000000029', '2026-10-20', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000288', 'a0000000-0000-0000-0000-000000000029', '2026-10-21', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000289', 'a0000000-0000-0000-0000-000000000029', '2026-10-22', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000290', 'a0000000-0000-0000-0000-000000000029', '2026-10-23', 'absent', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000291', 'a0000000-0000-0000-0000-000000000030', '2026-10-12', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000292', 'a0000000-0000-0000-0000-000000000030', '2026-10-13', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000293', 'a0000000-0000-0000-0000-000000000030', '2026-10-14', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000294', 'a0000000-0000-0000-0000-000000000030', '2026-10-15', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000295', 'a0000000-0000-0000-0000-000000000030', '2026-10-16', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000296', 'a0000000-0000-0000-0000-000000000030', '2026-10-19', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000297', 'a0000000-0000-0000-0000-000000000030', '2026-10-20', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000298', 'a0000000-0000-0000-0000-000000000030', '2026-10-21', 'present', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000299', 'a0000000-0000-0000-0000-000000000030', '2026-10-22', 'absent', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+INSERT INTO attendance (attendance_id, student_id, date, status, class_name) VALUES ('att-0000-0000-0000-000000000300', 'a0000000-0000-0000-0000-000000000030', '2026-10-23', 'tardy', '10C') ON CONFLICT (student_id, date) DO NOTHING;
+
+-- 6. REVIEW PROPOSALS
+INSERT INTO review_proposals (proposal_id, student_id, class_name, window_start, window_end, total_window_days, unexcused_absences, excused_absences, reason, evidence, ai_support_context, status, reviewed_at, reviewed_by) VALUES ('c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001', '10A', '2026-10-12', '2026-10-23', 10, 8, 0, 'RULE_8_OF_10_ABSENT: Sustained departure from 95.8% baseline with 8 unexcused absences in the last 10 sessions.', '{"window": "2026-10-12 to 2026-10-23", "total_days": 10, "unexcused_days": 8, "excused_medical_days": 0, "baseline_rate": 95.8, "window_rate": 20.0, "zero_labelling_verification": "PASSED_NON_PUNITIVE"}'::jsonb, '{"factual_summary": "Sustained departure from regular 95.8% baseline: 8 absences across the last 10 school sessions without recorded health notifications.", "potential_domains": ["Commuter/Transit route changes", "Unreported family care obligations", "Physical or wellness barriers"], "suggested_inquiry": "Hi Alex, we noticed you have been unable to make it into school recently and we wanted to make sure everything is okay. Is there anything happening that we can support you with?", "recommended_actions": ["Schedule an informal 10-minute check-in during advisory", "Warm pastoral outreach to family"]}'::jsonb, 'pending_approval', NULL, NULL) ON CONFLICT (proposal_id) DO NOTHING;
+INSERT INTO review_proposals (proposal_id, student_id, class_name, window_start, window_end, total_window_days, unexcused_absences, excused_absences, reason, evidence, ai_support_context, status, reviewed_at, reviewed_by) VALUES ('c0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000011', '10B', '2026-10-12', '2026-10-23', 10, 8, 0, 'RULE_8_OF_10_ABSENT: Sustained departure from 92.4% baseline with 8 unattended sessions.', '{"window": "2026-10-12 to 2026-10-23", "total_days": 10, "unexcused_days": 8, "excused_medical_days": 0, "is_public_flag": false, "disciplinary_action_taken": "NONE"}'::jsonb, '{"factual_summary": "8 sessions unattended over past two weeks departing from steady 92.4% prior rate.", "potential_domains": ["Transit route adjustments", "Family scheduling pressure"], "suggested_inquiry": "Good morning Taylor, just wanted to check in and see how getting in on morning buses has been going.", "recommended_actions": ["Low-stress pastoral check-in", "Provide alternative transit schedule guide"]}'::jsonb, 'approved', '2026-10-23T08:45:00Z', '11111111-1111-1111-1111-111111111111') ON CONFLICT (proposal_id) DO NOTHING;
+
+-- 7. COUNSELLOR REVIEWS
+INSERT INTO counsellor_reviews (review_id, proposal_id, student_id, counsellor_id, action_type, scheduled_checkin_date, completed_at, pastoral_outcome_notes, verification_status, verified_at, verification_evidence) VALUES ('d0000000-0000-0000-0000-000000000001', 'c0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000011', '11111111-1111-1111-1111-111111111111', 'supportive_counselor_checkin', '2026-10-24', '2026-10-24T10:15:00Z', 'Met with Taylor in pastoral suite. Student was very receptive. County transit line #42 was re-routed causing student to miss 1st period connection. School commuter office issued emergency transit shuttle pass.', 'verified_completed', '2026-10-24T15:00:00Z', '{"counsellor_signature": "Eleanor Vance, M.Ed.", "encounter_location": "Pastoral Suite 102", "duration_minutes": 20, "verification_hash": "v_hash_77a9b0c2"}'::jsonb) ON CONFLICT (review_id) DO NOTHING;
+
+-- 8. AUDIT LOGS
+INSERT INTO audit_logs (log_id, actor, actor_role, action, timestamp, result, related_entity, related_record_id, reason, metadata) VALUES ('e0000000-0000-0000-0000-000000000001', 'agent-verifier-01', 'system_agent', 'ACTION_VERIFIED', '2026-10-24T15:00:12Z', 'SUCCESS', 'counsellor_reviews', 'd0000000-0000-0000-0000-000000000001', 'Closed-loop verification confirmed completed pastoral notes and counsellor timestamp signature.', '{"studentCode": "STU-2026-011", "verification_hash": "v_hash_77a9b0c2"}'::jsonb) ON CONFLICT (log_id) DO NOTHING;
+INSERT INTO audit_logs (log_id, actor, actor_role, action, timestamp, result, related_entity, related_record_id, reason, metadata) VALUES ('e0000000-0000-0000-0000-000000000002', 'agent-triage-daily', 'system_agent', 'PROPOSAL_GENERATED', '2026-10-23T14:30:05Z', 'SUCCESS', 'review_proposals', 'c0000000-0000-0000-0000-000000000001', 'TC1 Trigger: Student STU-2026-001 absent 8 of last 10 days with 0 approved leave. Private proposal created pending human approval.', '{"studentCode": "STU-2026-001", "unexcused": 8, "zero_labelling": "CLEAN"}'::jsonb) ON CONFLICT (log_id) DO NOTHING;
+INSERT INTO audit_logs (log_id, actor, actor_role, action, timestamp, result, related_entity, related_record_id, reason, metadata) VALUES ('e0000000-0000-0000-0000-000000000003', 'agent-triage-daily', 'system_agent', 'EXCEPTION_EXCLUDED', '2026-10-23T14:30:04Z', 'EXCLUDED', 'attendance', 'a0000000-0000-0000-0000-000000000002', 'TC2 Applied: Student STU-2026-002 has 7 medical leave days covered by DOC-MED-84920. Effective unexcused = 1. Flag suppressed.', '{"studentCode": "STU-2026-002", "totalAbsences": 8, "medicalExcused": 7, "effectiveUnexcused": 1}'::jsonb) ON CONFLICT (log_id) DO NOTHING;
+INSERT INTO audit_logs (log_id, actor, actor_role, action, timestamp, result, related_entity, related_record_id, reason, metadata) VALUES ('e0000000-0000-0000-0000-000000000004', 'sarah.davis@school.edu', 'teacher', 'UNAUTHORIZED_ACCESS_BLOCKED', '2026-10-23T11:20:00Z', 'BLOCKED_BY_RLS', 'students', 'STU-2026-011', 'TC3 Applied: Teacher Sarah (assigned to 10A) attempted query on student STU-2026-011 from Class 10B. PostgreSQL RLS returned 0 rows.', '{"teacherClass": "10A", "attemptedTargetClass": "10B"}'::jsonb) ON CONFLICT (log_id) DO NOTHING;
+
+-- 9. TEST RUNS
+INSERT INTO test_runs (test_run_id, test_case, test_title, expected_result, actual_result, status, evidence) VALUES ('f0000000-0000-0000-0000-000000000001', 'TC1', 'Sustained Unexcused Absences Triage', 'Counsellor review item created in status pending_approval.', 'Proposal c0000000-0000-0000-0000-000000000001 created with status pending_approval.', 'passed', '{"studentCode": "STU-2026-001", "unexcusedAbsences": 8, "windowDays": 10}'::jsonb) ON CONFLICT (test_run_id) DO NOTHING;
+INSERT INTO test_runs (test_run_id, test_case, test_title, expected_result, actual_result, status, evidence) VALUES ('f0000000-0000-0000-0000-000000000002', 'TC2', 'Approved Medical Leave Exception', 'Student excluded from triage flag.', 'Effective unexcused absences = 1. Flag suppressed due to DOC-MED-84920.', 'passed', '{"studentCode": "STU-2026-002", "totalAbsences": 8, "medicalExcused": 7}'::jsonb) ON CONFLICT (test_run_id) DO NOTHING;
+INSERT INTO test_runs (test_run_id, test_case, test_title, expected_result, actual_result, status, evidence) VALUES ('f0000000-0000-0000-0000-000000000003', 'TC3', 'Cross-Class Unauthorized Access (RLS Check)', 'Staff from another class cannot see the data (0 rows returned).', 'PostgreSQL RLS returned 0 rows for Teacher Sarah on Class 10B student.', 'passed', '{"staff": "sarah.davis@school.edu", "targetClass": "10B", "rowsReturned": 0}'::jsonb) ON CONFLICT (test_run_id) DO NOTHING;
+INSERT INTO test_runs (test_run_id, test_case, test_title, expected_result, actual_result, status, evidence) VALUES ('f0000000-0000-0000-0000-000000000004', 'TC4', 'Zero-Labelling & Non-Punitive Compliance', 'No automatic punishment or public label. Proposal strictly in private queue.', 'Verified non-punitive: Proposal is quarantined in counsellor queue with zero derogatory tags.', 'passed', '{"hasPunishment": false, "hasTruantLabel": false, "isQuarantined": true}'::jsonb) ON CONFLICT (test_run_id) DO NOTHING;
