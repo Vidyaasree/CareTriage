@@ -38,10 +38,14 @@ export const Navbar: React.FC<NavbarProps> = ({
     ok: boolean;
     latencyMs: number;
     checking: boolean;
+    state?: 'active' | 'workflow_inactive' | 'test_mode_waiting' | 'offline';
+    message?: string;
+    hint?: string;
   }>({
     ok: true,
     latencyMs: 12,
     checking: false,
+    state: 'active',
   });
 
   const checkConnection = async () => {
@@ -51,6 +55,9 @@ export const Navbar: React.FC<NavbarProps> = ({
       ok: result.ok,
       latencyMs: result.latencyMs,
       checking: false,
+      state: result.state,
+      message: result.message,
+      hint: result.hint,
     });
   };
 
@@ -145,31 +152,56 @@ export const Navbar: React.FC<NavbarProps> = ({
           {/* Right Controls: Backend Status, Role Selector */}
           <div className="flex items-center gap-3">
             {/* Live n8n Backend Ping Indicator */}
-            <button
-              onClick={checkConnection}
-              disabled={backendStatus.checking}
-              className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium border transition-colors cursor-pointer ${
-                backendStatus.ok
-                  ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
-                  : 'bg-rose-50 text-rose-800 border-rose-200 hover:bg-rose-100'
-              }`}
-              title="Click to ping n8n backend"
-            >
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  backendStatus.ok ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'
-                }`}
-              ></span>
-              <Wifi className="w-3 h-3 text-slate-500" />
-              <span>
-                {backendStatus.checking
-                  ? 'Pinging...'
-                  : backendStatus.ok
-                  ? `n8n API Connected (${backendStatus.latencyMs}ms)`
-                  : 'n8n Offline'}
+            {backendStatus.checking ? (
+              <span className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium border bg-slate-50 text-slate-700 border-slate-200">
+                <RotateCw className="w-3 h-3 text-slate-500 animate-spin" />
+                <span>Pinging n8n...</span>
               </span>
-              <RotateCw className={`w-3 h-3 text-slate-400 ${backendStatus.checking ? 'animate-spin' : ''}`} />
-            </button>
+            ) : backendStatus.state === 'active' ? (
+              <button
+                onClick={checkConnection}
+                className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium border transition-colors cursor-pointer bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100"
+                title={`n8n Production API Connected (${backendStatus.latencyMs}ms). Click to ping.`}
+              >
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                <Wifi className="w-3 h-3 text-emerald-600" />
+                <span>n8n API Connected ({backendStatus.latencyMs}ms)</span>
+                <RotateCw className="w-3 h-3 text-slate-400 hover:text-slate-600" />
+              </button>
+            ) : backendStatus.state === 'workflow_inactive' ? (
+              <button
+                onClick={checkConnection}
+                className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium border transition-colors cursor-pointer bg-amber-50 text-amber-900 border-amber-300 hover:bg-amber-100"
+                title={backendStatus.hint || 'n8n reached, but workflow is inactive. Toggle Active in top-right of n8n editor.'}
+              >
+                <span className="w-2 h-2 rounded-full bg-amber-500" />
+                <Wifi className="w-3 h-3 text-amber-600" />
+                <span>Workflow Inactive in n8n</span>
+                <RotateCw className="w-3 h-3 text-slate-400 hover:text-slate-600" />
+              </button>
+            ) : backendStatus.state === 'test_mode_waiting' ? (
+              <button
+                onClick={checkConnection}
+                className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium border transition-colors cursor-pointer bg-blue-50 text-blue-900 border-blue-300 hover:bg-blue-100"
+                title={backendStatus.hint || "Click 'Execute workflow' button on n8n canvas to test."}
+              >
+                <span className="w-2 h-2 rounded-full bg-blue-500" />
+                <Wifi className="w-3 h-3 text-blue-600" />
+                <span>n8n Test Mode (Awaiting Run)</span>
+                <RotateCw className="w-3 h-3 text-slate-400 hover:text-slate-600" />
+              </button>
+            ) : (
+              <button
+                onClick={checkConnection}
+                className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium border transition-colors cursor-pointer bg-rose-50 text-rose-800 border-rose-200 hover:bg-rose-100"
+                title={backendStatus.hint || 'n8n backend unreachable. Click to retry ping.'}
+              >
+                <span className="w-2 h-2 rounded-full bg-rose-500" />
+                <Wifi className="w-3 h-3 text-slate-500" />
+                <span>n8n Offline</span>
+                <RotateCw className="w-3 h-3 text-slate-400 hover:text-slate-600" />
+              </button>
+            )}
 
             {/* Non-punitive guarantee badge */}
             <div className="hidden lg:flex items-center gap-1.5 px-3 py-1 bg-slate-50 text-slate-600 rounded-full border border-slate-200 text-xs">

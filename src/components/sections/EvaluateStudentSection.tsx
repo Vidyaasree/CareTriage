@@ -665,10 +665,12 @@ export const EvaluateStudentSection: React.FC<EvaluateStudentSectionProps> = ({
           <div className="text-[11px] text-rose-600 flex items-center gap-1.5 pt-1">
             <Info className="w-3.5 h-3.5 shrink-0" />
             <span>
-              {errorFeedback.status === 403
+              {errorFeedback.message.includes('must be active') || errorFeedback.message.includes('not registered')
+                ? 'n8n Workflow Inactive: In your n8n Cloud editor (vidyaa25.app.n8n.cloud), open the CareTriage workflow and switch the top-right toggle to Active.'
+                : errorFeedback.status === 403
                 ? 'Role-Based Access Control (TC3): Only staff assigned to this specific class or institutional counselors can access these records.'
                 : errorFeedback.status === 404
-                ? 'Student Not Found: The provided UUID or student identifier does not exist in the active school roster.'
+                ? 'Record Not Found: Verify student identifier exists in the roster or check that the webhook is active in n8n.'
                 : 'Invalid Request: Verify observation date order (start_date <= end_date) and required fields.'}
             </span>
           </div>

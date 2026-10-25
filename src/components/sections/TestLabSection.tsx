@@ -138,7 +138,7 @@ export const TestLabSection: React.FC<TestLabSectionProps> = ({ currentRole: _cu
     let httpStatus = 0;
     const logs: string[] = [
       `[${timestamp}] Initiating test run for ${tcCode}...`,
-      `[${timestamp}] Endpoint: ${n8nApi.getBaseUrl()}/triage-evaluate`,
+      `[${timestamp}] Endpoint: ${n8nApi.getWebhookUrl('triage-evaluate')}`,
       `[${timestamp}] Request Payload: ${JSON.stringify(target.inputPayload)}`,
     ];
 
@@ -363,7 +363,7 @@ export const TestLabSection: React.FC<TestLabSectionProps> = ({ currentRole: _cu
             Target Endpoint
           </span>
           <div className="mt-2 text-xs font-mono font-bold text-purple-950 truncate">
-            {n8nApi.getBaseUrl()}/triage-evaluate
+            {n8nApi.getWebhookUrl('triage-evaluate')}
           </div>
           <span className="text-[11px] text-purple-700 font-medium">n8n Live Webhook</span>
         </div>
